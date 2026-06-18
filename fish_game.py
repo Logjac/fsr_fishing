@@ -31,7 +31,7 @@ import pygame
 SCREEN_W, SCREEN_H = 1000, 700
 FPS = 60
 
-FSR_MAX = 4000.0          # DEFAULT max ceiling; overridden at runtime by calibration
+FSR_MAX = 2500.0          # DEFAULT max ceiling; overridden at runtime by calibration
 CAL_MIN = 200.0           # don't let a calibrated max be set lower than this (sanity)
 CONNECT_THRESHOLD = 0.92  # fraction of calibrated max needed to "lock on" to armor
 DISCONNECT_FORCE = 0.05   # below this (of calibrated max) magnet is considered detached
