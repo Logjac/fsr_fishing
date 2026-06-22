@@ -18,8 +18,8 @@ FSR_RAW_MAX = 3150
 
 # ---------------- Game tuning (tweak freely) ----------------
 GAME_DURATION = 60.0    # total round length (seconds)
-BITE_TIME     = 5.0     # magnets must stay attached this long for a fish to latch
-FILL_RATE     = 35.0    # catch-meter %/sec gained while pulling in the sweet spot
+BITE_TIME     = 3.0     # magnets must stay attached this long for a fish to latch
+FILL_RATE     = 18.0    # catch-meter %/sec gained while pulling in the sweet spot
 DROP_RATE     = 40.0    # catch-meter %/sec lost while detached during the reel
 METER_MAX     = 100.0
 CATCH_FLASH   = 1.2     # how long the "Nice catch!" celebration shows (seconds)
@@ -28,6 +28,14 @@ CATCH_FLASH   = 1.2     # how long the "Nice catch!" celebration shows (seconds)
 DETACH_T = 0.15   # below this           -> magnets are DETACHED
 PULL_T   = 0.70   # DETACH_T .. PULL_T    -> PULLING lightly  (fills the meter)
                   # above PULL_T          -> attached but RESTING (no fill)
+
+# Moving target band used while REELING (Stardew-style) - the player has to
+# track this band with their force. Kept away from DETACH_T since the FSR
+# reads unreliably near detachment, not near full force.
+TARGET_FLOOR = 0.40   # the band never asks for less force than this
+TARGET_CAP   = 1.00   # the band can ask for up to full force
+TARGET_WIDTH = 0.30   # width of the target band, in normalized force
+TARGET_FREQ  = 1.3    # rad/sec - how fast the band drifts back and forth
 
 SMOOTH = 0.35     # exponential smoothing on the raw reading (higher = snappier)
 
@@ -40,6 +48,7 @@ C_RED   = (214, 78, 72)
 C_GREEN = (96, 204, 116)
 C_BLUE  = (74, 152, 220)
 C_GOLD  = (236, 196, 92)
+C_AMBER = (224, 150, 60)
 C_TEXT  = (226, 230, 236)
 C_DIM   = (118, 128, 140)
 
@@ -65,18 +74,27 @@ def zone_of(norm):
 # ============================================================
 #  Drawing helpers
 # ============================================================
-def draw_zone_gauge(surface, cx, cy, radius, norm, fonts):
+def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=False, t=0.0):
     """Semicircle force gauge.
     norm 0..1 (1 = fully attached / resting, 0 = detached).
-    The track is shaded by zone so the player can aim for the green band."""
+    The track is shaded by zone so the player can aim for the green band.
+    If `target` is given as (lo, hi), it overrides the static green band with
+    a live, moving target window (used while reeling).
+    If `yank` is True (landing phase), all zone coloring drops away - the
+    track goes neutral and one big arrow points toward the 0 end, showing
+    the direction to pull the needle."""
     START_DEG, END_DEG = 180, 0
     sweep = 180.0
     inner = radius - 24
 
     for deg in range(END_DEG, START_DEG + 1):
         frac = (START_DEG - deg) / sweep          # 0 at left, 1 at right
-        if frac < DETACH_T:
+        if yank:
+            base = C_DIM
+        elif frac < DETACH_T:
             base = C_RED
+        elif target is not None:
+            base = C_GREEN if target[0] <= frac <= target[1] else C_AMBER
         elif frac < PULL_T:
             base = C_GREEN
         else:
@@ -100,9 +118,15 @@ def draw_zone_gauge(surface, cx, cy, radius, norm, fonts):
         ly = cy - (radius + 16) * math.sin(a)
         s = fonts['tiny'].render(text, True, color)
         surface.blit(s, (int(lx) - s.get_width() // 2, int(ly) - 6))
-    arc_label(0.06, "OFF", C_RED)
-    arc_label((DETACH_T + PULL_T) / 2, "PULL", C_GREEN)
-    arc_label(0.92, "HOLD", C_BLUE)
+    if yank:
+        arc_label(0.06, "YANK!", C_GOLD)
+    else:
+        arc_label(0.06, "OFF", C_RED)
+        if target is not None:
+            arc_label((target[0] + target[1]) / 2, "TARGET", C_GREEN)
+        else:
+            arc_label((DETACH_T + PULL_T) / 2, "PULL", C_GREEN)
+            arc_label(0.92, "HOLD", C_BLUE)
 
     # needle
     fill_deg = START_DEG - norm * sweep
@@ -113,13 +137,63 @@ def draw_zone_gauge(surface, cx, cy, radius, norm, fonts):
     pygame.draw.circle(surface, C_TEXT, (cx, cy), 8)
     pygame.draw.circle(surface, C_BG, (cx, cy), 3)
 
+    if yank:
+        # an arrow that curves along the outside of the arc, sweeping from
+        # the current needle position down to the 0 end, plus a burst of
+        # attention marks right at the tip - that's where to pull to
+        pulse = 0.5 + 0.5 * math.sin(t * 9)
+        curve_r = radius + 30
+        start_frac = max(0.30, min(0.92, norm))
+        steps = 28
+        arc_pts = []
+        for i in range(steps + 1):
+            frac = start_frac - (start_frac - 0.0) * (i / steps)
+            deg = START_DEG - frac * sweep
+            rad = math.radians(deg)
+            arc_pts.append((cx + curve_r * math.cos(rad), cy - curve_r * math.sin(rad)))
+        pygame.draw.lines(surface, C_GOLD, False, arc_pts, 5)
+
+        # arrowhead at the tip, oriented along the curve's direction of travel
+        tipx, tipy = arc_pts[-1]
+        px, py = arc_pts[-3]
+        ux, uy = tipx - px, tipy - py
+        ulen = math.hypot(ux, uy) or 1.0
+        ux, uy = ux / ulen, uy / ulen
+        perp = (-uy, ux)
+        nose = (tipx + ux * (16 + 4 * pulse), tipy + uy * (16 + 4 * pulse))
+        left = (tipx + perp[0] * 10, tipy + perp[1] * 10)
+        right = (tipx - perp[0] * 10, tipy - perp[1] * 10)
+        pygame.draw.polygon(surface, C_GOLD, [nose, left, right])
+
+        # attention burst right where the arrow points
+        for ang in (200, 220, 245, 270):
+            a = math.radians(ang)
+            r1 = 14 + 3 * pulse
+            r2 = 22 + 6 * pulse
+            x1 = tipx + r1 * math.cos(a)
+            y1 = tipy - r1 * math.sin(a)
+            x2 = tipx + r2 * math.cos(a)
+            y2 = tipy - r2 * math.sin(a)
+            pygame.draw.line(surface, C_GOLD, (x1, y1), (x2, y2), 2)
+
     # zone name under the hub
-    z = zone_of(norm)
-    name, col = {
-        'detached': ("DETACHED", C_RED),
-        'pulling':  ("PULLING",  C_GREEN),
-        'resting':  ("ATTACHED", C_BLUE),
-    }[z]
+    if yank:
+        name, col = "YANK!", C_GOLD
+    elif target is not None:
+        z = zone_of(norm)
+        if z == 'detached':
+            name, col = "DETACHED", C_RED
+        elif target[0] <= norm <= target[1]:
+            name, col = "ON TARGET", C_GREEN
+        else:
+            name, col = "ADJUST!", C_AMBER
+    else:
+        z = zone_of(norm)
+        name, col = {
+            'detached': ("DETACHED", C_RED),
+            'pulling':  ("PULLING",  C_GREEN),
+            'resting':  ("ATTACHED", C_BLUE),
+        }[z]
     s = fonts['mid'].render(name, True, col)
     surface.blit(s, (cx - s.get_width() // 2, cy + 14))
 
@@ -232,7 +306,15 @@ def main():
     bite_elapsed = 0.0
     meter = 0.0
     caught_timer = 0.0
+    reel_elapsed = 0.0
     t = 0.0
+
+    # bounds for the moving target's center, so the band itself never asks
+    # for less force than DETACH_T or more than TARGET_CAP
+    target_center_lo = TARGET_FLOOR + TARGET_WIDTH / 2
+    target_center_hi = TARGET_CAP - TARGET_WIDTH / 2
+    target_mid = (target_center_lo + target_center_hi) / 2
+    target_amp = (target_center_hi - target_center_lo) / 2
 
     def reset_game():
         nonlocal state, score, time_left, bite_elapsed, meter, caught_timer
@@ -297,6 +379,7 @@ def main():
         norm = max(0.0, min(1.0, (raw_smooth - cal_min) / span))
         z = zone_of(norm)
         attached = (z != 'detached')
+        target_lo = target_hi = None
 
         # -------- game clock --------
         if state not in ('ready', 'gameover'):
@@ -318,12 +401,16 @@ def main():
                 if bite_elapsed >= BITE_TIME:
                     state = 'reeling'
                     meter = 0.0
+                    reel_elapsed = 0.0
         elif state == 'reeling':
-            if z == 'pulling':
-                meter = min(METER_MAX, meter + FILL_RATE * dt)
-            elif z == 'detached':
+            target_center = target_mid + target_amp * math.sin(reel_elapsed * TARGET_FREQ)
+            target_lo = target_center - TARGET_WIDTH / 2
+            target_hi = target_center + TARGET_WIDTH / 2
+            reel_elapsed += dt
+            if not attached or not (target_lo <= norm <= target_hi):
                 meter = max(0.0, meter - DROP_RATE * dt)
-            # 'resting' -> hold
+            else:
+                meter = min(METER_MAX, meter + FILL_RATE * dt)
             if meter >= METER_MAX:
                 state = 'landing'
         elif state == 'landing':
@@ -348,7 +435,8 @@ def main():
         # pond + line + fish
         draw_pond(screen, POND, t)
         show_fish = state in ('biting', 'reeling', 'landing', 'caught')
-        line_col = C_GOLD if (state == 'reeling' and z == 'pulling') else (210, 210, 215)
+        in_target = target_lo is not None and target_lo <= norm <= target_hi
+        line_col = C_GOLD if (state == 'reeling' and in_target) else (210, 210, 215)
         draw_line_and_hook(screen, top_x, top_y, hook_x, hook_y, line_col)
         if show_fish:
             tug = 1.0 if state in ('reeling', 'landing') else 0.0
@@ -357,7 +445,9 @@ def main():
 
         # catch meter + gauge
         draw_catch_meter(screen, *METER, meter, state == 'landing', t, fonts)
-        draw_zone_gauge(screen, GCX, GCY, GR, norm, fonts)
+        gauge_target = (target_lo, target_hi) if target_lo is not None else None
+        draw_zone_gauge(screen, GCX, GCY, GR, norm, fonts, target=gauge_target,
+                         yank=(state == 'landing'), t=t)
         rawtxt = fonts['mono'].render(
             f"raw:{int(raw_smooth):>4}  min:{cal_min} max:{cal_max}", True, C_DIM)
         screen.blit(rawtxt, (GCX - rawtxt.get_width() // 2, GCY + 44))
@@ -372,7 +462,7 @@ def main():
             n = max(1, math.ceil(BITE_TIME - bite_elapsed))
             prompt, pcol = f"Something's nibbling... hold steady!   {n}", C_GOLD
         elif state == 'reeling':
-            prompt, pcol = "Reel it in!  Pull gently - keep the needle GREEN", C_GREEN
+            prompt, pcol = "Reel it in!  Track the moving TARGET zone", C_GREEN
         elif state == 'landing':
             prompt, pcol = "It's hooked!  YANK to land it!", C_GOLD
         elif state == 'caught':
