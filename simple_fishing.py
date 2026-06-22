@@ -3,6 +3,7 @@ import serial
 import serial.tools.list_ports
 import sys
 import math
+import random
 
 # ============================================================
 #  MAGNET FISHING  -  single-FSR catch game
@@ -14,6 +15,7 @@ SERIAL_PORT = None          # None = auto-detect
 BAUD_RATE   = 115200
 WIDTH, HEIGHT = 900, 600
 FPS = 60
+FSR_RAW_MIN = 300
 FSR_RAW_MAX = 3150
 
 # ---------------- Game tuning (tweak freely) ----------------
@@ -74,10 +76,12 @@ def zone_of(norm):
 # ============================================================
 #  Drawing helpers
 # ============================================================
-def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=False, t=0.0):
+def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=False, simple=False, t=0.0):
     """Semicircle force gauge.
     norm 0..1 (1 = fully attached / resting, 0 = detached).
     The track is shaded by zone so the player can aim for the green band.
+    If `simple` is True (casting/biting phase), only the two zones that
+    actually matter yet - DETACHED and ATTACHED - are shown.
     If `target` is given as (lo, hi), it overrides the static green band with
     a live, moving target window (used while reeling).
     If `yank` is True (landing phase), all zone coloring drops away - the
@@ -93,6 +97,8 @@ def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=Fals
             base = C_DIM
         elif frac < DETACH_T:
             base = C_RED
+        elif simple:
+            base = C_BLUE
         elif target is not None:
             base = C_GREEN if target[0] <= frac <= target[1] else C_AMBER
         elif frac < PULL_T:
@@ -122,7 +128,9 @@ def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=Fals
         arc_label(0.06, "YANK!", C_GOLD)
     else:
         arc_label(0.06, "OFF", C_RED)
-        if target is not None:
+        if simple:
+            arc_label((DETACH_T + 1.0) / 2, "ATTACHED", C_BLUE)
+        elif target is not None:
             arc_label((target[0] + target[1]) / 2, "TARGET", C_GREEN)
         else:
             arc_label((DETACH_T + PULL_T) / 2, "PULL", C_GREEN)
@@ -179,6 +187,8 @@ def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=Fals
     # zone name under the hub
     if yank:
         name, col = "YANK!", C_GOLD
+    elif simple:
+        name, col = ("DETACHED", C_RED) if norm < DETACH_T else ("ATTACHED", C_BLUE)
     elif target is not None:
         z = zone_of(norm)
         if z == 'detached':
@@ -252,6 +262,42 @@ def draw_line_and_hook(surface, top_x, top_y, hook_x, hook_y, taut_color):
     pygame.draw.circle(surface, (200, 60, 60), (hook_x, hook_y), 3)  # the magnet
 
 
+FIREWORK_COLORS = [C_GOLD, C_GREEN, C_BLUE, (255, 255, 255)]
+FIREWORK_GRAVITY = 240.0
+
+
+def spawn_firework(particles, x, y):
+    color = random.choice(FIREWORK_COLORS)
+    for _ in range(32):
+        ang = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(90, 320)
+        particles.append({
+            'x': x, 'y': y,
+            'vx': math.cos(ang) * speed,
+            'vy': math.sin(ang) * speed,
+            'age': 0.0,
+            'life': random.uniform(0.7, 1.4),
+            'color': color,
+        })
+
+
+def update_fireworks(particles, dt):
+    for p in particles:
+        p['age'] += dt
+        p['x'] += p['vx'] * dt
+        p['y'] += p['vy'] * dt
+        p['vy'] += FIREWORK_GRAVITY * dt
+    particles[:] = [p for p in particles if p['age'] < p['life']]
+
+
+def draw_fireworks(surface, particles):
+    for p in particles:
+        frac = max(0.0, 1.0 - p['age'] / p['life'])
+        r = max(1, int(6 * frac) + 2)
+        col = tuple(int(c * frac) for c in p['color'])
+        pygame.draw.circle(surface, col, (int(p['x']), int(p['y'])), r)
+
+
 # ============================================================
 #  Main
 # ============================================================
@@ -294,7 +340,7 @@ def main():
     # sensor / calibration
     raw1 = 0
     raw_smooth = 0.0
-    cal_min = 0
+    cal_min = FSR_RAW_MIN
     cal_max = FSR_RAW_MAX
     flash_msg = ''
     flash_timer = 0.0
@@ -307,6 +353,7 @@ def main():
     meter = 0.0
     caught_timer = 0.0
     reel_elapsed = 0.0
+    fireworks = []
     t = 0.0
 
     # bounds for the moving target's center, so the band itself never asks
@@ -324,6 +371,7 @@ def main():
         bite_elapsed = 0.0
         meter = 0.0
         caught_timer = 0.0
+        fireworks.clear()
 
     running = True
     while running:
@@ -418,10 +466,14 @@ def main():
                 score += 1
                 state = 'caught'
                 caught_timer = CATCH_FLASH
+                spawn_firework(fireworks, hook_x + 34, hook_y)
+                spawn_firework(fireworks, hook_x + 34, hook_y)
         elif state == 'caught':
             caught_timer -= dt
             if caught_timer <= 0:
                 state = 'casting'
+
+        update_fireworks(fireworks, dt)
 
         # ============== draw ==============
         screen.fill(C_BG)
@@ -442,12 +494,14 @@ def main():
             tug = 1.0 if state in ('reeling', 'landing') else 0.0
             fcol = C_GOLD if state == 'caught' else (180, 188, 196)
             draw_fish(screen, hook_x + 34, hook_y, t, fcol, tug)
+        draw_fireworks(screen, fireworks)
 
         # catch meter + gauge
         draw_catch_meter(screen, *METER, meter, state == 'landing', t, fonts)
         gauge_target = (target_lo, target_hi) if target_lo is not None else None
         draw_zone_gauge(screen, GCX, GCY, GR, norm, fonts, target=gauge_target,
-                         yank=(state == 'landing'), t=t)
+                         yank=(state == 'landing'),
+                         simple=(state in ('ready', 'casting', 'biting')), t=t)
         rawtxt = fonts['mono'].render(
             f"raw:{int(raw_smooth):>4}  min:{cal_min} max:{cal_max}", True, C_DIM)
         screen.blit(rawtxt, (GCX - rawtxt.get_width() // 2, GCY + 44))
