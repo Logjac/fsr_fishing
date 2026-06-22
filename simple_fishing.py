@@ -389,7 +389,7 @@ def main():
                     running = False
                 elif event.key == pygame.K_SPACE and state == 'ready':
                     reset_game()
-                elif event.key == pygame.K_r and state == 'gameover':
+                elif event.key == pygame.K_r:
                     reset_game()
                 elif event.key == pygame.K_o:
                     cal_min = int(raw_smooth)
@@ -486,10 +486,15 @@ def main():
 
         # pond + line + fish
         draw_pond(screen, POND, t)
-        show_fish = state in ('biting', 'reeling', 'landing', 'caught')
-        in_target = target_lo is not None and target_lo <= norm <= target_hi
-        line_col = C_GOLD if (state == 'reeling' and in_target) else (210, 210, 215)
-        draw_line_and_hook(screen, top_x, top_y, hook_x, hook_y, line_col)
+        if state not in ('ready', 'casting'):
+            in_target = target_lo is not None and target_lo <= norm <= target_hi
+            line_col = C_GOLD if (state == 'reeling' and in_target) else (210, 210, 215)
+            draw_line_and_hook(screen, top_x, top_y, hook_x, hook_y, line_col)
+        if state == 'biting':
+            wx = POND[0] + 60 + (POND[2] - 120) * (0.5 + 0.5 * math.sin(t * 0.6))
+            wy = POND[1] + 60 + (POND[3] - 120) * (0.5 + 0.5 * math.sin(t * 0.4 + 1.7))
+            draw_fish(screen, wx, wy, t, (150, 170, 185), 0.0)
+        show_fish = state in ('reeling', 'landing', 'caught')
         if show_fish:
             tug = 1.0 if state in ('reeling', 'landing') else 0.0
             fcol = C_GOLD if state == 'caught' else (180, 188, 196)
@@ -530,7 +535,7 @@ def main():
         if flash_timer > 0:
             fs = fonts['small'].render(flash_msg, True, C_GREEN)
             screen.blit(fs, (WIDTH // 2 - fs.get_width() // 2, 470))
-        ctrl = "O set min   P set max   ESC quit"
+        ctrl = "R reset   O set min   P set max   ESC quit"
         if kb_mode:
             ctrl = "[KEYBOARD MODE]  hold UP/DOWN = force    " + ctrl
         cs = fonts['tiny'].render(ctrl, True, (80, 88, 98))
