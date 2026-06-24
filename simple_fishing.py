@@ -1,13 +1,20 @@
 import pygame
 import serial
 import serial.tools.list_ports
+import os
 import sys
 import math
 import random
 
 # ============================================================
 #  MAGNET FISHING  -  single-FSR catch game
-#  Built on top of the FSR gauge example.
+#  Layout: the ocean (bg.png) fills the background, a hook
+#  (hook.png) hangs on a black string from the top center and
+#  rides up/down with pressure, a fish bites the hook and rides
+#  with it, parallax bubbles drift up at varying depths, and one
+#  combined PRESSURE meter sits on the right (a vertical bar with
+#  zones + a moving mouse/pressure indicator line). The "what to
+#  do" prompt is centered low on the screen.
 # ============================================================
 
 # ---------------- Serial / display ----------------
@@ -18,11 +25,13 @@ FPS = 60
 FSR_RAW_MIN = 300
 FSR_RAW_MAX = 3150
 
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
 # ---------------- Game tuning (tweak freely) ----------------
-GAME_DURATION = 60.0    # total round length (seconds)
 BITE_TIME     = 3.0     # magnets must stay attached this long for a fish to latch
-FILL_RATE     = 18.0    # catch-meter %/sec gained while pulling in the sweet spot
-DROP_RATE     = 40.0    # catch-meter %/sec lost while detached during the reel
+FILL_RATE     = 24.0    # catch-meter %/sec gained while pulling in the sweet spot
+DROP_RATE     = 36.0    # catch-meter %/sec lost while detached during the reel
+METER_START   = 20.0    # catch meter starts here when a fish is hooked
 METER_MAX     = 100.0
 CATCH_FLASH   = 1.2     # how long the "Nice catch!" celebration shows (seconds)
 
@@ -34,18 +43,30 @@ PULL_T   = 0.70   # DETACH_T .. PULL_T    -> PULLING lightly  (fills the meter)
 # Moving target band used while REELING (Stardew-style) - the player has to
 # track this band with their force. Kept away from DETACH_T since the FSR
 # reads unreliably near detachment, not near full force.
-TARGET_FLOOR = 0.40   # the band never asks for less force than this
+TARGET_FLOOR = 0.32   # the band never asks for less force than this
 TARGET_CAP   = 1.00   # the band can ask for up to full force
-TARGET_WIDTH = 0.30   # width of the target band, in normalized force
-TARGET_FREQ  = 1.3    # rad/sec - how fast the band drifts back and forth
+TARGET_WIDTH = 0.30   # width of the target band, in normalized force (narrow = hard)
+TARGET_SPEED = 0.8    # norm/sec - how fast the band chases its next spot
+RETARGET_MIN = 0.6    # the band jumps to a new random spot this often...
+RETARGET_MAX = 1.4    # ...up to this long between jumps (seconds)
+
+# Reel marker physics: a damped spring pulls the marker toward the live
+# pressure (its rest target). Three knobs fully define the system.
+SPRING_K = 40.0   # stiffness: how hard the marker is pulled toward the pressure
+SPRING_C = 6.0    # damping: how fast velocity bleeds off (low -> springy overshoot)
+SPRING_M = 1.0    # mass: inertia of the marker
 
 SMOOTH = 0.35     # exponential smoothing on the raw reading (higher = snappier)
 
+# How the hook hangs as pressure swings 0..1. 0 pressure = fully pulled off
+# (hook lifted off the top of the screen); full pressure = resting deep.
+HOOK_H        = 160                      # rendered hook height (px)
+HOOK_OFF_TOP  = -HOOK_H - 20             # top edge when 0 pressure (off-screen)
+HOOK_DEEP     = HEIGHT - HOOK_H - 110    # top edge when resting attached
+
 # ---------------- Colors ----------------
-C_BG    = (16, 20, 28)
 C_PANEL = (26, 32, 42)
-C_WATER = (32, 92, 138)
-C_WATER_DK = (20, 60, 96)
+C_STRING = (12, 12, 16)
 C_RED   = (214, 78, 72)
 C_GREEN = (96, 204, 116)
 C_BLUE  = (74, 152, 220)
@@ -53,6 +74,21 @@ C_GOLD  = (236, 196, 92)
 C_AMBER = (224, 150, 60)
 C_TEXT  = (226, 230, 236)
 C_DIM   = (118, 128, 140)
+
+# Live-tunable reel parameters shown in the in-game panel (TAB to toggle).
+# (global name, label, step, min, max, value format)
+TUN_SPEC = [
+    ('SPRING_K',      'stiffness',2.0,  1.0, 200.0, '{:.0f}'),
+    ('SPRING_C',      'damping',  0.5,  0.0, 40.0,  '{:.1f}'),
+    ('SPRING_M',      'mass',     0.1,  0.1, 8.0,   '{:.1f}'),
+    ('TARGET_WIDTH',  'band w',   0.01, 0.05, 0.6, '{:.2f}'),
+    ('TARGET_SPEED',  'band spd', 0.1,  0.0, 4.0,  '{:.1f}'),
+    ('RETARGET_MIN',  'jump min', 0.05, 0.05, 3.0, '{:.2f}'),
+    ('RETARGET_MAX',  'jump max', 0.05, 0.05, 3.0, '{:.2f}'),
+    ('FILL_RATE',     'fill',     2.0,  2.0, 100., '{:.0f}'),
+    ('DROP_RATE',     'drop',     2.0,  2.0, 200., '{:.0f}'),
+    ('METER_START',   'start %',  5.0,  0.0, 90.0, '{:.0f}'),
+]
 
 
 def find_esp32_port():
@@ -74,192 +110,155 @@ def zone_of(norm):
 
 
 # ============================================================
+#  Assets
+# ============================================================
+def load_background():
+    """Load bg.png and scale it to *cover* the window (keep aspect, crop)."""
+    bg = pygame.image.load(os.path.join(ASSET_DIR, "bg.png")).convert()
+    bw, bh = bg.get_size()
+    scale = max(WIDTH / bw, HEIGHT / bh)
+    img = pygame.transform.smoothscale(bg, (int(bw * scale), int(bh * scale)))
+    off = ((WIDTH - img.get_width()) // 2, (HEIGHT - img.get_height()) // 2)
+    return img, off
+
+
+def load_hook():
+    src = pygame.image.load(os.path.join(ASSET_DIR, "hook.png")).convert_alpha()
+    w, h = src.get_size()
+    return pygame.transform.smoothscale(src, (int(w * HOOK_H / h), HOOK_H))
+
+
+def load_bubble_sprites():
+    """bubbles4.png is a 2x2 grid -> return the four bubble sprites."""
+    sheet = pygame.image.load(os.path.join(ASSET_DIR, "bubbles4.png")).convert_alpha()
+    w, h = sheet.get_size()
+    cw, ch = w // 2, h // 2
+    sprites = []
+    for gy in range(2):
+        for gx in range(2):
+            sprites.append(sheet.subsurface((gx * cw, gy * ch, cw, ch)).copy())
+    return sprites
+
+
+class Bubble:
+    """A drifting bubble at a random depth. Far bubbles (depth -> 0) are
+    smaller, slower and fainter; near bubbles (depth -> 1) are bigger,
+    faster and more opaque, giving a parallax sense of depth. Each bubble
+    cycles through all four bubbles4 sprites over time for a shimmer."""
+
+    def __init__(self, sprites):
+        self.sprites = sprites
+        self._respawn(initial=True)
+
+    def _respawn(self, initial=False):
+        self.depth = random.random()                       # 0 far .. 1 near
+        self.diam = int(10 + self.depth * 32)              # 10..42 px
+        alpha = int(95 + self.depth * 160)                 # 95..255
+        # pre-render all four sprites at this bubble's size + opacity
+        self.frames = []
+        for sprite in self.sprites:
+            img = pygame.transform.smoothscale(sprite, (self.diam, self.diam))
+            img.fill((255, 255, 255, alpha), special_flags=pygame.BLEND_RGBA_MULT)
+            self.frames.append(img)
+        self.anim_fps = random.uniform(3.0, 7.0)           # frame cycle speed
+        self.anim_offset = random.uniform(0, len(self.frames))
+        self.speed = 10 + self.depth * 48                  # px/sec upward
+        self.sway_amp = 3 + self.depth * 9
+        self.sway_freq = random.uniform(0.6, 1.5)
+        self.sway_phase = random.uniform(0, math.tau)
+        self.x = random.uniform(0, WIDTH)
+        self.y = random.uniform(0, HEIGHT) if initial else HEIGHT + self.diam
+
+    def update(self, dt):
+        self.y -= self.speed * dt
+        if self.y < -self.diam:
+            self._respawn()
+
+    def draw(self, surface, t):
+        sx = self.x + self.sway_amp * math.sin(t * self.sway_freq + self.sway_phase)
+        frame = int(t * self.anim_fps + self.anim_offset) % len(self.frames)
+        surface.blit(self.frames[frame], (int(sx - self.diam / 2), int(self.y - self.diam / 2)))
+
+
+# ============================================================
 #  Drawing helpers
 # ============================================================
-def draw_zone_gauge(surface, cx, cy, radius, norm, fonts, target=None, yank=False, simple=False, t=0.0):
-    """Semicircle force gauge.
-    norm 0..1 (1 = fully attached / resting, 0 = detached).
-    The track is shaded by zone so the player can aim for the green band.
-    If `simple` is True (casting/biting phase), only the two zones that
-    actually matter yet - DETACHED and ATTACHED - are shown.
-    If `target` is given as (lo, hi), it overrides the static green band with
-    a live, moving target window (used while reeling).
-    If `yank` is True (landing phase), all zone coloring drops away - the
-    track goes neutral and one big arrow points toward the 0 end, showing
-    the direction to pull the needle."""
-    START_DEG, END_DEG = 180, 0
-    sweep = 180.0
-    inner = radius - 24
-
-    for deg in range(END_DEG, START_DEG + 1):
-        frac = (START_DEG - deg) / sweep          # 0 at left, 1 at right
-        if yank:
-            base = C_DIM
-        elif frac < DETACH_T:
-            base = C_RED
-        elif simple:
-            base = C_BLUE
-        elif target is not None:
-            base = C_GREEN if target[0] <= frac <= target[1] else C_AMBER
-        elif frac < PULL_T:
-            base = C_GREEN
-        else:
-            base = C_BLUE
-        # filled portion bright, the rest dimmed
-        if frac <= norm:
-            col = base
-        else:
-            col = tuple(int(c * 0.28) for c in base)
-        rad = math.radians(deg)
-        x1 = cx + inner * math.cos(rad)
-        y1 = cy - inner * math.sin(rad)
-        x2 = cx + radius * math.cos(rad)
-        y2 = cy - radius * math.sin(rad)
-        pygame.draw.line(surface, col, (int(x1), int(y1)), (int(x2), int(y2)), 3)
-
-    # zone tick labels along the arc
-    def arc_label(frac, text, color):
-        a = math.radians(START_DEG - frac * sweep)
-        lx = cx + (radius + 16) * math.cos(a)
-        ly = cy - (radius + 16) * math.sin(a)
-        s = fonts['tiny'].render(text, True, color)
-        surface.blit(s, (int(lx) - s.get_width() // 2, int(ly) - 6))
-    if yank:
-        arc_label(0.06, "YANK!", C_GOLD)
-    else:
-        arc_label(0.06, "OFF", C_RED)
-        if simple:
-            arc_label((DETACH_T + 1.0) / 2, "ATTACHED", C_BLUE)
-        elif target is not None:
-            arc_label((target[0] + target[1]) / 2, "TARGET", C_GREEN)
-        else:
-            arc_label((DETACH_T + PULL_T) / 2, "PULL", C_GREEN)
-            arc_label(0.92, "HOLD", C_BLUE)
-
-    # needle
-    fill_deg = START_DEG - norm * sweep
-    nrad = math.radians(fill_deg)
-    nx = cx + (radius - 8) * math.cos(nrad)
-    ny = cy - (radius - 8) * math.sin(nrad)
-    pygame.draw.line(surface, C_TEXT, (cx, cy), (int(nx), int(ny)), 4)
-    pygame.draw.circle(surface, C_TEXT, (cx, cy), 8)
-    pygame.draw.circle(surface, C_BG, (cx, cy), 3)
-
-    if yank:
-        # an arrow that curves along the outside of the arc, sweeping from
-        # the current needle position down to the 0 end, plus a burst of
-        # attention marks right at the tip - that's where to pull to
-        pulse = 0.5 + 0.5 * math.sin(t * 9)
-        curve_r = radius + 30
-        start_frac = max(0.30, min(0.92, norm))
-        steps = 28
-        arc_pts = []
-        for i in range(steps + 1):
-            frac = start_frac - (start_frac - 0.0) * (i / steps)
-            deg = START_DEG - frac * sweep
-            rad = math.radians(deg)
-            arc_pts.append((cx + curve_r * math.cos(rad), cy - curve_r * math.sin(rad)))
-        pygame.draw.lines(surface, C_GOLD, False, arc_pts, 5)
-
-        # arrowhead at the tip, oriented along the curve's direction of travel
-        tipx, tipy = arc_pts[-1]
-        px, py = arc_pts[-3]
-        ux, uy = tipx - px, tipy - py
-        ulen = math.hypot(ux, uy) or 1.0
-        ux, uy = ux / ulen, uy / ulen
-        perp = (-uy, ux)
-        nose = (tipx + ux * (16 + 4 * pulse), tipy + uy * (16 + 4 * pulse))
-        left = (tipx + perp[0] * 10, tipy + perp[1] * 10)
-        right = (tipx - perp[0] * 10, tipy - perp[1] * 10)
-        pygame.draw.polygon(surface, C_GOLD, [nose, left, right])
-
-        # attention burst right where the arrow points
-        for ang in (200, 220, 245, 270):
-            a = math.radians(ang)
-            r1 = 14 + 3 * pulse
-            r2 = 22 + 6 * pulse
-            x1 = tipx + r1 * math.cos(a)
-            y1 = tipy - r1 * math.sin(a)
-            x2 = tipx + r2 * math.cos(a)
-            y2 = tipy - r2 * math.sin(a)
-            pygame.draw.line(surface, C_GOLD, (x1, y1), (x2, y2), 2)
-
-    # zone name under the hub
-    if yank:
-        name, col = "YANK!", C_GOLD
-    elif simple:
-        name, col = ("DETACHED", C_RED) if norm < DETACH_T else ("ATTACHED", C_BLUE)
-    elif target is not None:
-        z = zone_of(norm)
-        if z == 'detached':
-            name, col = "DETACHED", C_RED
-        elif target[0] <= norm <= target[1]:
-            name, col = "ON TARGET", C_GREEN
-        else:
-            name, col = "ADJUST!", C_AMBER
-    else:
-        z = zone_of(norm)
-        name, col = {
-            'detached': ("DETACHED", C_RED),
-            'pulling':  ("PULLING",  C_GREEN),
-            'resting':  ("ATTACHED", C_BLUE),
-        }[z]
-    s = fonts['mid'].render(name, True, col)
-    surface.blit(s, (cx - s.get_width() // 2, cy + 14))
-
-
-def draw_catch_meter(surface, x, y, w, h, pct, full, t, fonts):
-    pygame.draw.rect(surface, C_PANEL, (x, y, w, h), border_radius=8)
-    fh = int((pct / 100.0) * (h - 6))
-    fy = y + h - 3 - fh
-    col = C_GOLD if pct >= 99 else C_GREEN
-    if fh > 0:
-        pygame.draw.rect(surface, col, (x + 3, fy, w - 6, fh), border_radius=6)
-    border = C_GOLD if full else (66, 74, 86)
-    bw = 3 if not full else int(2 + 2 * (0.5 + 0.5 * math.sin(t * 9)))
-    pygame.draw.rect(surface, border, (x, y, w, h), bw, border_radius=8)
-
-    lbl = fonts['tiny'].render("CATCH", True, C_DIM)
-    surface.blit(lbl, (x + w // 2 - lbl.get_width() // 2, y - 20))
-    pc = fonts['small'].render(f"{int(pct)}%", True, C_TEXT)
-    surface.blit(pc, (x + w // 2 - pc.get_width() // 2, y + h + 6))
-
-
-def draw_pond(surface, rect, t):
+def draw_pressure_meter(surface, rect, norm, target, state, t, fonts, catch_pct):
+    """Combined PRESSURE widget: one vertical bar showing the force axis
+    (0 = pulled off at the TOP, 1 = resting attached at the BOTTOM) with zone
+    shading, plus a moving indicator line that tracks the live mouse/pressure
+    value. During reeling the static zones become the moving green TARGET band;
+    during landing it flips to a neutral track with a YANK cue. The catch
+    progress fills the bar's outline from the bottom up (gold + pulsing once
+    full)."""
     x, y, w, h = rect
-    pygame.draw.rect(surface, C_WATER, rect, border_radius=12)
-    # depth shading toward the bottom
-    band = pygame.Surface((w, h), pygame.SRCALPHA)
-    for i in range(h):
-        a = int(70 * (i / h))
-        pygame.draw.line(band, (*C_WATER_DK, a), (0, i), (w, i))
-    surface.blit(band, (x, y))
-    # animated ripple lines
-    for k in range(3):
-        yy = y + 30 + k * 26
-        pts = []
-        for i in range(0, w + 1, 10):
-            pts.append((x + i, yy + 4 * math.sin(i * 0.05 + t * 2 + k)))
-        if len(pts) > 1:
-            pygame.draw.lines(surface, (*C_WATER_DK, 0)[:3], False, pts, 1)
-    pygame.draw.rect(surface, (60, 120, 162), rect, 2, border_radius=12)
+
+    def yb(frac):
+        # 0 -> top of the bar, 1 -> bottom
+        frac = max(0.0, min(1.0, frac))
+        return int(y + h * frac)
+
+    def dim(c):
+        return tuple(int(v * 0.32) for v in c)
+
+    # backing panel
+    pygame.draw.rect(surface, C_PANEL, (x - 6, y - 6, w + 12, h + 12), border_radius=10)
+
+    yank = (state == 'landing')
+    if yank:
+        pygame.draw.rect(surface, (46, 54, 66), (x, y, w, h), border_radius=6)
+    elif target is not None:
+        lo, hi = target
+        pygame.draw.rect(surface, dim(C_AMBER), (x, y, w, h), border_radius=6)
+        pygame.draw.rect(surface, C_GREEN, (x, yb(lo), w, yb(hi) - yb(lo)))
+    else:
+        # static zones: red (detached/pulled off) on top, green (pull), blue (rest) at bottom
+        pygame.draw.rect(surface, dim(C_RED), (x, y, w, yb(DETACH_T) - y))
+        pygame.draw.rect(surface, dim(C_GREEN), (x, yb(DETACH_T), w, yb(PULL_T) - yb(DETACH_T)))
+        pygame.draw.rect(surface, dim(C_BLUE), (x, yb(PULL_T), w, y + h - yb(PULL_T)))
+
+    # current-pressure fill (translucent, from the top down to the indicator)
+    iy = yb(norm)
+    if iy - y > 0:
+        fill = pygame.Surface((w, iy - y), pygame.SRCALPHA)
+        fill.fill((255, 255, 255, 38))
+        surface.blit(fill, (x, y))
+
+    # dim base outline
+    pygame.draw.rect(surface, (74, 84, 98), (x, y, w, h), 2, border_radius=6)
+    # catch progress fills the outline from the bottom up
+    if catch_pct > 0:
+        fy = int(y + h - h * min(1.0, catch_pct / 100.0))
+        full = catch_pct >= 99
+        glow = C_GOLD if full else C_GREEN
+        gw = int(3 + 2 * (0.5 + 0.5 * math.sin(t * 9))) if full else 3
+        prev_clip = surface.get_clip()
+        surface.set_clip(pygame.Rect(x - gw, fy, w + 2 * gw, (y + h) - fy + gw))
+        pygame.draw.rect(surface, glow, (x, y, w, h), gw, border_radius=6)
+        surface.set_clip(prev_clip)
+
+    # the moving mouse / pressure indicator line
+    ind = C_GOLD if yank else C_TEXT
+    pygame.draw.line(surface, ind, (x - 12, iy), (x + w + 12, iy), 4)
+    if yank:
+        # pulsing arrow pointing UP -> yank the line toward 0 pressure (detach)
+        pulse = int(4 * (0.5 + 0.5 * math.sin(t * 9)))
+        ax = x + w + 26
+        pygame.draw.polygon(surface, C_GOLD,
+                            [(ax - 8, iy), (ax + 8, iy), (ax, iy - 14 - pulse)])
 
 
-def draw_fish(surface, cx, cy, t, color, tug=0.0):
+def draw_fish(surface, cx, cy, t, color, tug=0.0, scale=1.0):
+    def s(v):
+        return int(v * scale)
     cx = int(cx + tug * 6 * math.sin(t * 30))
     bob = math.sin(t * 2) * 3
     cy = int(cy + bob)
-    pygame.draw.ellipse(surface, color, (cx - 24, cy - 11, 48, 22))
+    pygame.draw.ellipse(surface, color, (cx - s(24), cy - s(11), s(48), s(22)))
     pygame.draw.polygon(surface, color,
-                        [(cx - 22, cy), (cx - 40, cy - 11), (cx - 40, cy + 11)])
-    pygame.draw.circle(surface, (250, 250, 250), (cx + 13, cy - 3), 4)
-    pygame.draw.circle(surface, (20, 20, 20), (cx + 14, cy - 3), 2)
-
-
-def draw_line_and_hook(surface, top_x, top_y, hook_x, hook_y, taut_color):
-    pygame.draw.line(surface, taut_color, (top_x, top_y), (hook_x, hook_y), 2)
-    pygame.draw.circle(surface, (40, 40, 46), (hook_x, hook_y), 6)
-    pygame.draw.circle(surface, (200, 60, 60), (hook_x, hook_y), 3)  # the magnet
+                        [(cx - s(22), cy), (cx - s(40), cy - s(11)), (cx - s(40), cy + s(11))])
+    pygame.draw.circle(surface, (250, 250, 250), (cx + s(13), cy - s(3)), max(2, s(4)))
+    pygame.draw.circle(surface, (20, 20, 20), (cx + s(14), cy - s(3)), max(1, s(2)))
 
 
 FIREWORK_COLORS = [C_GOLD, C_GREEN, C_BLUE, (255, 255, 255)]
@@ -298,13 +297,32 @@ def draw_fireworks(surface, particles):
         pygame.draw.circle(surface, col, (int(p['x']), int(p['y'])), r)
 
 
+def draw_tuning_panel(surface, fonts, tun, sel_idx):
+    """Live reel-parameter editor (toggle with TAB)."""
+    x, y = 16, 58
+    pad, line_h, w = 8, 20, 256
+    h = pad * 2 + line_h * (len(TUN_SPEC) + 1)
+    panel = pygame.Surface((w, h), pygame.SRCALPHA)
+    panel.fill((10, 16, 24, 205))
+    surface.blit(panel, (x, y))
+    pygame.draw.rect(surface, (70, 84, 98), (x, y, w, h), 1, border_radius=6)
+    surface.blit(fonts['tiny'].render("TAB hide   up/down pick   left/right adjust",
+                                      True, C_DIM), (x + pad, y + pad))
+    for i, (key, label, step, lo, hi, fmt) in enumerate(TUN_SPEC):
+        ry = y + pad + line_h * (i + 1)
+        sel = (i == sel_idx)
+        col = C_GOLD if sel else C_TEXT
+        txt = f"{'>' if sel else ' '} {label:<9}{fmt.format(tun[key])}"
+        surface.blit(fonts['mono'].render(txt, True, col), (x + pad, ry))
+
+
 # ============================================================
 #  Main
 # ============================================================
 def main():
     port = SERIAL_PORT or find_esp32_port()
     ser = None
-    kb_mode = False
+    mouse_mode = False
     if port:
         try:
             ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
@@ -312,12 +330,13 @@ def main():
         except Exception as e:
             print(f"Could not open {port}: {e}")
     if ser is None:
-        kb_mode = True
-        print("No serial connection -> KEYBOARD TEST MODE (hold UP / DOWN to fake force).")
+        mouse_mode = True
+        print("No serial connection -> MOUSE TEST MODE (move the mouse up/down to fake force).")
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Magnet Fishing")
+    pygame.key.set_repeat(250, 60)   # hold arrows to keep adjusting tuning values
     clock = pygame.time.Clock()
 
     fonts = {
@@ -328,14 +347,24 @@ def main():
         'mono':  pygame.font.SysFont('monospace', 13),
     }
 
-    # layout
-    POND  = (24, 80, 470, 380)
-    METER = (512, 80, 42, 380)
-    GCX, GCY, GR = 730, 305, 140
-    hook_x = POND[0] + POND[2] // 2
-    hook_y = POND[1] + int(POND[3] * 0.5)
-    top_x  = hook_x
-    top_y  = POND[1] + 4
+    # ---- assets ----------------------------------------------------------
+    bg_img, bg_off = load_background()
+    hook_img = load_hook()
+    hook_w = hook_img.get_width()
+    bubble_sprites = load_bubble_sprites()
+    bubbles = [Bubble(bubble_sprites) for _ in range(34)]
+
+    # ---- layout ----------------------------------------------------------
+    # the right-side combined pressure meter (vertical bar)
+    PM_W = 50
+    PM_X = WIDTH - 96
+    PM_Y = 100
+    PM_H = HEIGHT - 210
+    PRESSURE = (PM_X, PM_Y, PM_W, PM_H)
+    # the string hangs down the screen center; the hook (and the fish biting
+    # it) sit centered on that same line
+    string_cx = WIDTH // 2
+    hook_cx = string_cx
 
     # sensor / calibration
     raw1 = 0
@@ -345,10 +374,9 @@ def main():
     flash_msg = ''
     flash_timer = 0.0
 
-    # game state
-    state = 'ready'            # ready -> casting -> biting -> reeling -> landing -> caught -> (gameover)
+    # game state (starts fishing immediately, loops forever; R restarts the score)
+    state = 'casting'          # casting -> biting -> reeling -> landing -> caught -> casting
     score = 0
-    time_left = GAME_DURATION
     bite_elapsed = 0.0
     meter = 0.0
     caught_timer = 0.0
@@ -357,17 +385,26 @@ def main():
     t = 0.0
 
     # bounds for the moving target's center, so the band itself never asks
-    # for less force than DETACH_T or more than TARGET_CAP
+    # for less force than TARGET_FLOOR or more than TARGET_CAP
     target_center_lo = TARGET_FLOOR + TARGET_WIDTH / 2
     target_center_hi = TARGET_CAP - TARGET_WIDTH / 2
-    target_mid = (target_center_lo + target_center_hi) / 2
-    target_amp = (target_center_hi - target_center_lo) / 2
+    # the band wanders toward a random destination, re-picking frequently
+    target_center = target_center_hi
+    target_dest = target_center_hi
+    retarget_timer = 0.0
+    # the player-controlled marker (acceleration-based) chases the band
+    reel_pos = target_center_hi
+    reel_vel = 0.0
+
+    # live-tunable reel params (TAB toggles the editor panel; hidden by default)
+    tun = {key: globals()[key] for key, *_ in TUN_SPEC}
+    tun_visible = False
+    sel_idx = 0
 
     def reset_game():
-        nonlocal state, score, time_left, bite_elapsed, meter, caught_timer
+        nonlocal state, score, bite_elapsed, meter, caught_timer
         state = 'casting'
         score = 0
-        time_left = GAME_DURATION
         bite_elapsed = 0.0
         meter = 0.0
         caught_timer = 0.0
@@ -387,8 +424,6 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
-                elif event.key == pygame.K_SPACE and state == 'ready':
-                    reset_game()
                 elif event.key == pygame.K_r:
                     reset_game()
                 elif event.key == pygame.K_o:
@@ -399,14 +434,24 @@ def main():
                     cal_max = int(raw_smooth)
                     flash_msg = f"max set -> {cal_max}"
                     flash_timer = 1.8
+                elif event.key == pygame.K_TAB:
+                    tun_visible = not tun_visible
+                elif event.key == pygame.K_UP:
+                    sel_idx = (sel_idx - 1) % len(TUN_SPEC)
+                elif event.key == pygame.K_DOWN:
+                    sel_idx = (sel_idx + 1) % len(TUN_SPEC)
+                elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                    key, _lbl, step, lo, hi, _fmt = TUN_SPEC[sel_idx]
+                    d = step if event.key == pygame.K_RIGHT else -step
+                    tun[key] = round(min(hi, max(lo, tun[key] + d)), 4)
 
-        # -------- input: serial or keyboard --------
-        if kb_mode:
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_UP]:
-                raw1 = min(FSR_RAW_MAX, raw1 + 90)
-            if keys[pygame.K_DOWN]:
-                raw1 = max(0, raw1 - 90)
+        # -------- input: serial or mouse --------
+        if mouse_mode:
+            # mouse Y drives force to match the bar/hook: top = 0 (pulled off),
+            # bottom = max (resting attached)
+            _, my = pygame.mouse.get_pos()
+            frac = max(0.0, min(1.0, my / HEIGHT))
+            raw1 = frac * FSR_RAW_MAX
         else:
             try:
                 while ser.in_waiting:
@@ -423,123 +468,189 @@ def main():
 
         # smooth + normalize
         raw_smooth += SMOOTH * (raw1 - raw_smooth)
+        # when fully released (yanked off), snap straight to 0 with no smoothing lag
+        if raw1 <= cal_min:
+            raw_smooth = float(raw1)
         span = (cal_max - cal_min) or 1
         norm = max(0.0, min(1.0, (raw_smooth - cal_min) / span))
-        z = zone_of(norm)
-        attached = (z != 'detached')
         target_lo = target_hi = None
 
-        # -------- game clock --------
-        if state not in ('ready', 'gameover'):
-            time_left -= dt
-            if time_left <= 0:
-                time_left = 0.0
-                state = 'gameover'
+        # hook position from pressure: 0 -> off the top of the screen,
+        # full pressure -> resting deep
+        hook_top = HOOK_OFF_TOP + (HOOK_DEEP - HOOK_OFF_TOP) * norm
+        hook_left = hook_cx - hook_w // 2
+        bite_x = hook_cx
+        bite_y = hook_top + HOOK_H * 0.66      # where the fish grabs the barb
+
+        # spring-based reel marker: a damped spring pulls it toward live pressure.
+        # Runs in every state so the spring is already live before a fish arrives.
+        if raw1 <= cal_min:
+            # fully yanked off -> snap the marker straight to 0, ignore momentum
+            reel_pos, reel_vel = 0.0, 0.0
+        else:
+            accel = (tun['SPRING_K'] * (norm - reel_pos)
+                     - tun['SPRING_C'] * reel_vel) / tun['SPRING_M']
+            reel_vel += accel * dt
+            reel_pos += reel_vel * dt
+            if reel_pos < 0.0:
+                reel_pos, reel_vel = 0.0, 0.0
+            elif reel_pos > 1.0:
+                reel_pos, reel_vel = 1.0, 0.0
+        # all minigame zone logic follows the marker, not the raw pressure
+        mz = zone_of(reel_pos)
+        marker_attached = (mz != 'detached')
 
         # -------- state machine --------
         if state == 'casting':
-            if attached:
+            if marker_attached:
                 state = 'biting'
                 bite_elapsed = 0.0
         elif state == 'biting':
-            if not attached:
-                state = 'casting'           # let go too soon, no bite
-            else:
+            if not marker_attached:
+                state = 'casting'           # let go entirely -> lost it
+            elif mz == 'resting':           # hold steady in the blue to hook it
                 bite_elapsed += dt
                 if bite_elapsed >= BITE_TIME:
                     state = 'reeling'
-                    meter = 0.0
+                    meter = tun['METER_START']
                     reel_elapsed = 0.0
+                    target_center = target_center_hi   # start up in the blue
+                    target_dest = target_center_hi
+                    retarget_timer = random.uniform(tun['RETARGET_MIN'], tun['RETARGET_MAX'])
+                    # the spring marker carries over seamlessly (no reset)
+            # attached but not in the blue: the bite timer just pauses
         elif state == 'reeling':
-            target_center = target_mid + target_amp * math.sin(reel_elapsed * TARGET_FREQ)
-            target_lo = target_center - TARGET_WIDTH / 2
-            target_hi = target_center + TARGET_WIDTH / 2
             reel_elapsed += dt
-            if not attached or not (target_lo <= norm <= target_hi):
-                meter = max(0.0, meter - DROP_RATE * dt)
+            # live target-band bounds (band width is tunable in real time)
+            tw = tun['TARGET_WIDTH']
+            tc_lo = TARGET_FLOOR + tw / 2
+            tc_hi = TARGET_CAP - tw / 2
+            # the band jumps to a fresh random spot on a short random timer,
+            # then chases it -> erratic, hard to track
+            retarget_timer -= dt
+            if retarget_timer <= 0:
+                target_dest = random.uniform(tc_lo, tc_hi)
+                retarget_timer = random.uniform(tun['RETARGET_MIN'], tun['RETARGET_MAX'])
+            target_center = min(tc_hi, max(tc_lo, target_center))
+            # ease toward the destination: fast at first, decelerating as it nears
+            k = 1.0 - math.exp(-tun['TARGET_SPEED'] * 4.0 * dt)
+            target_center += (target_dest - target_center) * k
+            target_lo = target_center - tw / 2
+            target_hi = target_center + tw / 2
+            if reel_pos < DETACH_T:
+                # marker slipped into the red mid-reel -> the fish escapes
+                state = 'casting'
             else:
-                meter = min(METER_MAX, meter + FILL_RATE * dt)
-            if meter >= METER_MAX:
-                state = 'landing'
+                if not (target_lo <= reel_pos <= target_hi):
+                    meter = max(0.0, meter - tun['DROP_RATE'] * dt)
+                else:
+                    meter = min(METER_MAX, meter + tun['FILL_RATE'] * dt)
+                if meter <= 0:
+                    state = 'casting'       # fish got away -> look for another
+                elif meter >= METER_MAX:
+                    state = 'landing'
         elif state == 'landing':
-            if z == 'detached':             # the yank!
+            if reel_pos < DETACH_T:         # yank the marker up into the red to land!
                 score += 1
                 state = 'caught'
                 caught_timer = CATCH_FLASH
-                spawn_firework(fireworks, hook_x + 34, hook_y)
-                spawn_firework(fireworks, hook_x + 34, hook_y)
+                meter = 0.0                 # empty the meter so the gold flash clears
+                spawn_firework(fireworks, bite_x, bite_y)
+                spawn_firework(fireworks, bite_x, bite_y)
         elif state == 'caught':
             caught_timer -= dt
             if caught_timer <= 0:
                 state = 'casting'
 
+        # bubbles drift up regardless of state
+        for b in bubbles:
+            b.update(dt)
+        bubbles.sort(key=lambda b: b.depth)   # draw far behind near
         update_fireworks(fireworks, dt)
 
         # ============== draw ==============
-        screen.fill(C_BG)
+        # ocean background
+        screen.blit(bg_img, bg_off)
+        # parallax bubbles (far -> near)
+        for b in bubbles:
+            b.draw(screen, t)
 
         # HUD
-        screen.blit(fonts['big'].render(f"Score {score}", True, C_TEXT), (24, 18))
-        tcol = C_RED if time_left <= 10 and state not in ('ready', 'gameover') else C_TEXT
-        tstr = fonts['big'].render(f"{int(time_left):02d}s", True, tcol)
-        screen.blit(tstr, (WIDTH - tstr.get_width() - 24, 18))
+        screen.blit(fonts['big'].render(f"{score} fish caught", True, C_TEXT), (24, 18))
 
-        # pond + line + fish
-        draw_pond(screen, POND, t)
-        if state not in ('ready', 'casting'):
-            in_target = target_lo is not None and target_lo <= norm <= target_hi
-            line_col = C_GOLD if (state == 'reeling' and in_target) else (210, 210, 215)
-            draw_line_and_hook(screen, top_x, top_y, hook_x, hook_y, line_col)
+        # black string straight down the screen center, to the hook's depth
+        pygame.draw.line(screen, C_STRING, (string_cx, 0), (string_cx, int(hook_top + 6)), 3)
+        # the hook sprite, offset left of the string, riding up/down with pressure
+        screen.blit(hook_img, (int(hook_left), int(hook_top)))
+
+        # the fish stays off-screen for the first second, then swims in from
+        # the left and reaches the hook (center) as the nibble timer runs out
         if state == 'biting':
-            wx = POND[0] + 60 + (POND[2] - 120) * (0.5 + 0.5 * math.sin(t * 0.6))
-            wy = POND[1] + 60 + (POND[3] - 120) * (0.5 + 0.5 * math.sin(t * 0.4 + 1.7))
-            draw_fish(screen, wx, wy, t, (150, 170, 185), 0.0)
-        show_fish = state in ('reeling', 'landing', 'caught')
-        if show_fish:
+            APPEAR = 1.0   # seconds spent fully off the left edge
+            OFF_X = -170   # x where the 4x fish is fully off-screen
+            if bite_elapsed < APPEAR:
+                swim = 0.0
+            else:
+                swim = (bite_elapsed - APPEAR) / max(0.001, BITE_TIME - APPEAR)
+            base_x = OFF_X + (hook_cx - OFF_X) * swim
+            # the approaching fish ignores player pressure: it swims at the
+            # full-pressure (resting) depth as if pressure were 100%
+            rest_bite_y = HOOK_DEEP + HOOK_H * 0.66
+            wx = base_x + (1.0 - swim) * 30 * math.sin(t * 1.6)
+            wy = rest_bite_y + (1.0 - swim) * 70 + 20 * math.sin(t * 1.3 + 1.7)
+            draw_fish(screen, wx, wy, t, (150, 170, 185), 0.0, scale=4.0)
+        # once hooked, the fish has eaten the hook and rides up/down with it
+        if state in ('reeling', 'landing', 'caught'):
             tug = 1.0 if state in ('reeling', 'landing') else 0.0
             fcol = C_GOLD if state == 'caught' else (180, 188, 196)
-            draw_fish(screen, hook_x + 34, hook_y, t, fcol, tug)
+            # offset left by a quarter of the fish's body width so the mouth sits on the hook
+            fish_off = int(48 * 4.0 / 4)
+            draw_fish(screen, bite_x - fish_off, bite_y, t, fcol, tug, scale=4.0)
         draw_fireworks(screen, fireworks)
 
-        # catch meter + gauge
-        draw_catch_meter(screen, *METER, meter, state == 'landing', t, fonts)
-        gauge_target = (target_lo, target_hi) if target_lo is not None else None
-        draw_zone_gauge(screen, GCX, GCY, GR, norm, fonts, target=gauge_target,
-                         yank=(state == 'landing'),
-                         simple=(state in ('ready', 'casting', 'biting')), t=t)
-        rawtxt = fonts['mono'].render(
-            f"raw:{int(raw_smooth):>4}  min:{cal_min} max:{cal_max}", True, C_DIM)
-        screen.blit(rawtxt, (GCX - rawtxt.get_width() // 2, GCY + 44))
+        # right-side combined pressure meter (its outline fills with catch progress)
+        # the indicator always shows the spring marker, not raw pressure
+        meter_target = (target_lo, target_hi) if target_lo is not None else None
+        draw_pressure_meter(screen, PRESSURE, reel_pos, meter_target, state, t, fonts, meter)
 
-        # state prompt
+        # state prompt, centered low on the screen
         prompt, pcol = "", C_TEXT
-        if state == 'ready':
-            prompt, pcol = "Press SPACE to start fishing", C_TEXT
-        elif state == 'casting':
+        if state == 'casting':
             prompt, pcol = "Drop the line  -  attach the magnets to cast", C_BLUE
         elif state == 'biting':
-            n = max(1, math.ceil(BITE_TIME - bite_elapsed))
-            prompt, pcol = f"Something's nibbling... hold steady!   {n}", C_GOLD
+            if mz == 'resting':
+                n = max(1, math.ceil(BITE_TIME - bite_elapsed))
+                prompt, pcol = f"Something's nibbling... hold steady!   {n}", C_GOLD
+            else:
+                prompt, pcol = "Press into the blue to hook it!", C_BLUE
         elif state == 'reeling':
-            prompt, pcol = "Reel it in!  Track the moving TARGET zone", C_GREEN
+            # adapt the prompt to where the marker sits relative to the target band
+            if target_lo is not None and reel_pos < target_lo:
+                prompt, pcol = "More pressure - drive the marker down to the target!", C_AMBER
+            elif target_hi is not None and reel_pos > target_hi:
+                prompt, pcol = "Less pressure - let the marker rise to the target!", C_AMBER
+            else:
+                prompt, pcol = "On target - keep it steady and reel it in!", C_GREEN
         elif state == 'landing':
             prompt, pcol = "It's hooked!  YANK to land it!", C_GOLD
         elif state == 'caught':
             prompt, pcol = "Nice catch!  +1", C_GREEN
-        elif state == 'gameover':
-            prompt, pcol = f"Time!  Final score: {score}   -   Press R to play again", C_TEXT
         ps = fonts['mid'].render(prompt, True, pcol)
-        screen.blit(ps, (WIDTH // 2 - ps.get_width() // 2, 498))
+        screen.blit(ps, (WIDTH // 2 - ps.get_width() // 2, HEIGHT - 72))
 
-        # flash + controls footer
+        # live reel-tuning panel
+        if tun_visible:
+            draw_tuning_panel(screen, fonts, tun, sel_idx)
+
+        # flash + controls footer (centered low)
         if flash_timer > 0:
             fs = fonts['small'].render(flash_msg, True, C_GREEN)
-            screen.blit(fs, (WIDTH // 2 - fs.get_width() // 2, 470))
-        ctrl = "R reset   O set min   P set max   ESC quit"
-        if kb_mode:
-            ctrl = "[KEYBOARD MODE]  hold UP/DOWN = force    " + ctrl
-        cs = fonts['tiny'].render(ctrl, True, (80, 88, 98))
-        screen.blit(cs, (WIDTH // 2 - cs.get_width() // 2, 560))
+            screen.blit(fs, (WIDTH // 2 - fs.get_width() // 2, HEIGHT - 100))
+        ctrl = "R reset   O set min   P set max   TAB tune   ESC quit"
+        if mouse_mode:
+            ctrl = "[MOUSE MODE]  move mouse up/down = force    " + ctrl
+        cs = fonts['tiny'].render(ctrl, True, (210, 220, 230))
+        screen.blit(cs, (WIDTH // 2 - cs.get_width() // 2, HEIGHT - 30))
 
         pygame.display.flip()
 
