@@ -334,7 +334,13 @@ def main():
         print("No serial connection -> MOUSE TEST MODE (move the mouse up/down to fake force).")
 
     pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    fullscreen = False
+
+    def set_display_mode():
+        flags = pygame.FULLSCREEN if fullscreen else 0
+        return pygame.display.set_mode((WIDTH, HEIGHT), flags)
+
+    screen = set_display_mode()
     pygame.display.set_caption("Magnet Fishing")
     pygame.key.set_repeat(250, 60)   # hold arrows to keep adjusting tuning values
     clock = pygame.time.Clock()
@@ -444,6 +450,9 @@ def main():
                     key, _lbl, step, lo, hi, _fmt = TUN_SPEC[sel_idx]
                     d = step if event.key == pygame.K_RIGHT else -step
                     tun[key] = round(min(hi, max(lo, tun[key] + d)), 4)
+                elif event.key == pygame.K_f:
+                    fullscreen = not fullscreen
+                    screen = set_display_mode()
 
         # -------- input: serial or mouse --------
         if mouse_mode:
@@ -646,7 +655,7 @@ def main():
         if flash_timer > 0:
             fs = fonts['small'].render(flash_msg, True, C_GREEN)
             screen.blit(fs, (WIDTH // 2 - fs.get_width() // 2, HEIGHT - 100))
-        ctrl = "R reset   O set min   P set max   TAB tune   ESC quit"
+        ctrl = "R reset   O set min   P set max   TAB tune   F fullscreen   ESC quit"
         if mouse_mode:
             ctrl = "[MOUSE MODE]  move mouse up/down = force    " + ctrl
         cs = fonts['tiny'].render(ctrl, True, (210, 220, 230))
