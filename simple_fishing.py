@@ -635,9 +635,9 @@ def main():
         elif state == 'reeling':
             # adapt the prompt to where the marker sits relative to the target band
             if target_lo is not None and reel_pos < target_lo:
-                prompt, pcol = "More pressure - drive the marker down to the target!", C_AMBER
+                prompt, pcol = "Ease up - Make the market drop to the target!", C_AMBER
             elif target_hi is not None and reel_pos > target_hi:
-                prompt, pcol = "Less pressure - let the marker rise to the target!", C_AMBER
+                prompt, pcol = "Pull gently - Make the marker rise to the target!", C_AMBER
             else:
                 prompt, pcol = "On target - keep it steady and reel it in!", C_GREEN
         elif state == 'landing':
